@@ -10,11 +10,18 @@ export function retryDelay(value, now, fallback) {
   return Number.isFinite(date) ? Math.max(fallback, date - now) : fallback;
 }
 
+const TRANSPORT_CODES = new Set(['ECONNRESET', 'ECONNREFUSED', 'EPIPE', 'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT', 'UND_ERR_SOCKET']);
+
+function isTransportError(error) {
+  return TRANSPORT_CODES.has(error?.code) || TRANSPORT_CODES.has(error?.cause?.code);
+}
+
 export class KeyPool {
-  constructor(config, { fetchImpl = fetch, now = Date.now } = {}) {
+  constructor(config, { fetchImpl = fetch, now = () => performance.now(), wallNow = Date.now } = {}) {
     this.config = config;
     this.fetch = fetchImpl;
     this.now = now;
+    this.wallNow = wallNow;
     this.keys = config.keys.map((secret, index) => ({ secret, label: `key-${index + 1}`, until: 0, disabled: false, reason: null, calls: 0, successes: 0, inflight: 0 }));
     this.cursor = 0;
     this.active = 0;
@@ -22,7 +29,7 @@ export class KeyPool {
   }
 
   redact(text) {
-    for (const key of this.keys) text = text.split(key.secret).join('[REDACTED]');
+    for (const key of [...this.keys].sort((a, b) => b.secret.length - a.secret.length)) text = text.split(key.secret).join('[REDACTED]');
     return text;
   }
 
@@ -63,13 +70,15 @@ export class KeyPool {
       while (tried.size < this.keys.length) {
         if (signal?.aborted) throw new PoolError('CANCELLED', 'Request cancelled');
         if (deadline.aborted) throw new PoolError('TIMEOUT', 'Overall request deadline exceeded');
+        // Another in-flight call may have opened the service circuit while we awaited I/O.
+        if (this.globalUntil > this.now()) throw new PoolError('SERVICE_COOLDOWN', 'Exa service is cooling down; no further attempts.');
         const selected = this.choose(tried);
         if (!selected) break;
         const [key, index] = selected;
         tried.add(index);
         key.inflight++; key.calls++;
+        const combined = AbortSignal.any([deadline, AbortSignal.timeout(this.config.timeoutMs), ...(signal ? [signal] : [])]);
         try {
-          const combined = AbortSignal.any([deadline, AbortSignal.timeout(this.config.timeoutMs), ...(signal ? [signal] : [])]);
           const response = await this.fetch(`https://api.exa.ai${path}`, {
             method: 'POST', redirect: 'error',
             headers: { 'content-type': 'application/json', 'x-api-key': key.secret },
@@ -77,6 +86,7 @@ export class KeyPool {
           });
           if (response.ok) {
             // Bound memory even when an upstream response ignores requested limits.
+            if (!response.body) throw new PoolError('INVALID_RESPONSE', 'Exa returned an empty response body');
             const reader = response.body.getReader();
             const chunks = []; let size = 0;
             try {
@@ -85,7 +95,7 @@ export class KeyPool {
                 if (done) break;
                 size += value.byteLength;
                 if (size > 2_000_000) {
-                  await reader.cancel();
+                  void reader.cancel().catch(() => {});
                   throw new PoolError('RESPONSE_TOO_LARGE', 'Exa response exceeds the 2 MB safety limit');
                 }
                 chunks.push(Buffer.from(value));
@@ -95,26 +105,28 @@ export class KeyPool {
             try { data = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
             catch { throw new PoolError('INVALID_RESPONSE', 'Exa returned invalid JSON'); }
             if (!data || !Array.isArray(data.results)) throw new PoolError('INVALID_RESPONSE', 'Exa response has no results array');
+            combined.throwIfAborted();
             key.successes++; key.reason = null;
             return data;
           }
           // Do not echo provider error bodies; they can contain credentials/queries.
           const retryAfter = response.headers.get('retry-after');
-          await response.body?.cancel();
+          // Cleanup must not mask status/Retry-After or hold up failover.
+          try { void response.body?.cancel().catch(() => {}); } catch {}
           if ([401, 403].includes(response.status)) {
             key.disabled = true; key.reason = `http_${response.status}`; continue;
           }
           if (response.status === 402) {
-            key.until = this.now() + retryDelay(retryAfter, this.now(), this.config.paymentCooldownMs);
+            key.until = this.now() + retryDelay(retryAfter, this.wallNow(), this.config.paymentCooldownMs);
             key.reason = 'payment_required'; continue;
           }
           if (response.status === 429) {
-            key.until = this.now() + retryDelay(retryAfter, this.now(), this.config.rateCooldownMs);
+            key.until = this.now() + retryDelay(retryAfter, this.wallNow(), this.config.rateCooldownMs);
             key.reason = 'rate_limited'; continue;
           }
           if (response.status >= 500) {
             // A service-wide failure is unlikely to be fixed by spending other keys.
-            this.globalUntil = this.now() + retryDelay(retryAfter, this.now(), 15000);
+            this.globalUntil = Math.max(this.globalUntil, this.now() + retryDelay(retryAfter, this.wallNow(), 15000));
             throw new PoolError('UPSTREAM_UNAVAILABLE', 'Exa service error; cooling down all keys. Try later or use native search.');
           }
           throw new PoolError('UPSTREAM_REJECTED', `Exa rejected the request (HTTP ${response.status}); no key rotation. Check arguments.`);
@@ -122,10 +134,14 @@ export class KeyPool {
           if (signal?.aborted) throw new PoolError('CANCELLED', 'Request cancelled');
           if (deadline.aborted) throw new PoolError('TIMEOUT', 'Overall request deadline exceeded');
           if (error instanceof PoolError) throw error;
+          // Only known transport failures are retryable; bugs/TLS/redirect errors are not.
+          if (!combined.aborted && !isTransportError(error)) {
+            throw new PoolError('INTERNAL_ERROR', 'Non-retryable local or transport error; stopped without rotating keys.');
+          }
           key.until = this.now() + 15000; key.reason = 'network_or_timeout';
           transientFailures++;
           if (transientFailures >= 2) {
-            this.globalUntil = this.now() + 15000;
+            this.globalUntil = Math.max(this.globalUntil, this.now() + 15000);
             throw new PoolError('NETWORK_ERROR', 'Two transport attempts failed; stopping to avoid duplicate charges.');
           }
         } finally { key.inflight--; }

@@ -77,7 +77,7 @@ test('round-robin visits each key', async () => {
 });
 
 test('network error retries at most once and never echoes raw error', async () => {
-  const { pool, calls } = fixture([new Error('secret-one'), new Error('secret-two')]);
+  const { pool, calls } = fixture([Object.assign(new Error('secret-one'), { code: 'ECONNRESET' }), Object.assign(new Error('secret-two'), { code: 'ECONNRESET' })]);
   await assert.rejects(pool.request('/search', {}), e => e.code === 'NETWORK_ERROR' && !e.message.includes('secret'));
   assert.equal(calls.length, 2);
 });

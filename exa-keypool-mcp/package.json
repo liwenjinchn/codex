@@ -1,6 +1,6 @@
 {
   "name": "exa-keypool-mcp",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "Local Exa MCP with independent-team API key failover for Claude Code",
   "type": "module",

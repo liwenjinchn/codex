@@ -68,7 +68,7 @@ test('content budgeting preserves JSON/citations and de-duplicates URLs', () => 
   assert.equal(output.results.length, 2);
   assert.ok(output.results.reduce((n, r) => n + r.content.length, 0) <= 1000);
   assert.equal(output.truncated, true);
-  assert.equal(JSON.parse(JSON.stringify(output)).results[0].url, 'https://example.com/a');
+  assert.equal(JSON.parse(JSON.stringify(output)).results[0].url, 'https://example.com/a#one');
 });
 
 test('key-file permissions, precedence, duplicate removal and invalid config', () => {
