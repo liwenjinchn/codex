@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "exa-pool": {
+      "command": "node",
+      "args": ["/ABSOLUTE/PATH/exa-keypool-mcp/src/index.js"],
+      "env": {
+        "EXA_KEYS_FILE": "/ABSOLUTE/PATH/private/exa-keys.json",
+        "EXA_KEY_STRATEGY": "priority"
+      }
+    }
+  }
+}
